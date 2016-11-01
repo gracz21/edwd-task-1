@@ -16,11 +16,39 @@ public class Main {
 
 
     public static void main(String[] args) throws IOException, ClassNotFoundException, SQLException {
+        setupConnection();
+
+        setupSchemas();
+
+        loadToOldSchema();
+        loadToNewSchema();
+
+        setupIndexes();
+
+        con.close();
+    }
+
+    private static void setupConnection() throws ClassNotFoundException, SQLException {
+        con = null;
+        Class.forName("org.sqlite.JDBC");
+        con = DriverManager.getConnection("jdbc:sqlite:test.db");
+        con.setAutoCommit(false);
+        System.out.println("Opened database successfully");
+    }
+
+    private static void openFiles() throws FileNotFoundException, UnsupportedEncodingException {
         uniqueTracks = new BufferedReader(
                 new InputStreamReader(new FileInputStream("./res/unique_tracks.txt"), "ISO-8859-1"));
         tripletsSample = new BufferedReader(
                 new InputStreamReader(new FileInputStream("./res/triplets_sample_20p.txt")));
+    }
 
+    private static void closeFiles() throws IOException {
+        uniqueTracks.close();
+        tripletsSample.close();
+    }
+
+    private static void setupSchemas() throws SQLException {
         tablesMap.put("OLD_SONGS", Queries.oldSongsCreateQuery);
         tablesMap.put("OLD_PLAYBACKS", Queries.oldPlaybacksCreateQuery);
         tablesMap.put("SONGS", Queries.songsCreateQuery);
@@ -30,21 +58,6 @@ public class Main {
         tablesMap.put("TIMES", Queries.timesCreateQuery);
         tablesMap.put("USERS", Queries.usersCreateQuery);
 
-        con = null;
-        Class.forName("org.sqlite.JDBC");
-        con = DriverManager.getConnection("jdbc:sqlite:test.db");
-        con.setAutoCommit(false);
-        System.out.println("Opened database successfully");
-
-        setupSchemas();
-
-        loadToOldSchema();
-        //loadToNewSchema();
-
-        con.close();
-    }
-
-    private static void setupSchemas() throws SQLException {
         DatabaseMetaData meta = con.getMetaData();
         ResultSet res;
 
@@ -59,32 +72,56 @@ public class Main {
         }
     }
 
+    private static void setupIndexes() throws SQLException {
+        long startTime = System.nanoTime();
+        Statement stmt = con.createStatement();
+
+        stmt.execute(Queries.indexOnSongIdFkCreateQuery);
+        stmt.execute(Queries.indexOnArtistIdFkCreateQuery);
+        stmt.execute(Queries.indexOnDateIdFkCreateQuery);
+        stmt.execute(Queries.indexOnTimeIdFkCreateQuery);
+        stmt.execute(Queries.indexOnUserIdFkCreateQuery);
+
+        con.commit();
+
+        stmt.close();
+        long elapsedTime = System.nanoTime() - startTime;
+        System.out.println("Finished index creation in " + elapsedTime/1000000000.0 + " s");
+    }
+
     private static void loadToOldSchema() throws IOException, SQLException {
-        final String insertIntoOldSongsQuery = "INSERT OR IGNORE INTO OLD_SONGS VALUES (?, ?, ?)";
+        openFiles();
+
+        final String insertIntoOldSongsQuery = "INSERT INTO OLD_SONGS VALUES (?, ?, ?)";
         final String insertIntoOldPlaybacksQuery = "INSERT INTO OLD_PLAYBACKS(USER_ID, SONG_ID, TIMESTAMP) VALUES (?, ?, ?)";
 
         PreparedStatement ps;
         String line;
         String[] splittedLine;
 
+        Set<String> songsSet = new HashSet<>();
+
         long startTime = System.nanoTime();
         ps = con.prepareStatement(insertIntoOldSongsQuery);
         while((line = uniqueTracks.readLine()) != null) {
             splittedLine = line.split("<SEP>");
 
-            if(splittedLine.length != 4) {
-                continue;
+            if(!songsSet.contains(splittedLine[1])) {
+                ps.setString(1, splittedLine[1]);
+                ps.setString(2, splittedLine[2]);
+                if(splittedLine.length == 4) {
+                    ps.setString(3, splittedLine[3]);
+                } else {
+                    ps.setString(3, null);
+                }
+                ps.addBatch();
+                songsSet.add(splittedLine[1]);
             }
-
-            ps.setString(1, splittedLine[1]);
-            ps.setString(2, splittedLine[2]);
-            ps.setString(3, splittedLine[3]);
-            ps.addBatch();
         }
         ps.executeBatch();
         ps.close();
         con.commit();
-        System.out.println("Finished old songs");
+        System.out.println("Finished first file");
 
         int i = 0;
         ps = con.prepareStatement(insertIntoOldPlaybacksQuery);
@@ -110,15 +147,19 @@ public class Main {
         ps.close();
 
         long elapsedTime = System.nanoTime() - startTime;
-        System.out.println("Finished old schema in " + elapsedTime/1000000000 + " s");
+        System.out.println("Finished old schema in " + elapsedTime/1000000000.0 + " s");
+
+        closeFiles();
     }
 
     private static void loadToNewSchema() throws SQLException, IOException {
-        final String insertIntoSongs = "INSERT OR IGNORE INTO SONGS(OLD_ID, TITLE) VALUES (?, ?)";
-        final String insertIntoArtists = "INSERT OR IGNORE INTO ARTISTS(NAME) VALUES (?)";
-        final String insertIntoDates = "INSERT OR IGNORE INTO DATES(YEAR, MONTH, DAY) VALUES (?, ?, ?)";
+        openFiles();
+
+        final String insertIntoSongs = "INSERT INTO SONGS(OLD_ID, TITLE) VALUES (?, ?)";
+        final String insertIntoArtists = "INSERT INTO ARTISTS(NAME) VALUES (?)";
+        final String insertIntoDates = "INSERT INTO DATES(YEAR, MONTH, DAY) VALUES (?, ?, ?)";
         final String insertIntoTimes = "INSERT OR IGNORE INTO TIMES(HOUR, MINUTE) VALUES (?, ?)";
-        final String insertIntoUsers = "INSERT OR IGNORE INTO USERS(OLD_ID) VALUES(?)";
+        final String insertIntoUsers = "INSERT INTO USERS(OLD_ID) VALUES(?)";
         final String insertIntoPlaybacks = "INSERT INTO PLAYBACKS(SONG_ID, ARTIST_ID, DATE_ID, TIME_ID, USER_ID) " +
                 "VALUES (?, ?, ?, ?, ?)";
 
@@ -145,10 +186,6 @@ public class Main {
         while((line = uniqueTracks.readLine()) != null) {
             splittedLine = line.split("<SEP>");
 
-            if(splittedLine.length != 4) {
-                continue;
-            }
-
             if(!artistNameToIdMap.containsKey(splittedLine[2])) {
                 artistNameToIdMap.put(splittedLine[2], artistIdCounter);
                 artistIdCounter++;
@@ -161,7 +198,11 @@ public class Main {
                 songsOldIdToArtistIdMap.put(splittedLine[1], artistNameToIdMap.get(splittedLine[2]));
                 songIdCounter++;
                 ps[0].setString(1, splittedLine[1]);
-                ps[0].setString(2, splittedLine[3]);
+                if(splittedLine.length == 4) {
+                    ps[0].setString(2, splittedLine[3]);
+                } else {
+                    ps[0].setString(2, null);
+                }
                 ps[0].addBatch();
             }
         }
@@ -236,6 +277,8 @@ public class Main {
             p.close();
         }
         long elapsedTime = System.nanoTime() - startTime;
-        System.out.println("Finished new schema in " + elapsedTime/1000000000 + " s");
+        System.out.println("Finished new schema in " + elapsedTime/1000000000.0 + " s");
+
+        closeFiles();
     }
 }
